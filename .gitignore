@@ -32,7 +32,8 @@ extra/datasets/kits/
 extra/datasets/COCO/
 extra/datasets/audio*
 extra/weights
-venv
+venv 
+myenv/
 examples/**/net.*[js,json]
 examples/**/*.safetensors
 node_modules
