@@ -70,9 +70,9 @@ class MultiLazyBuffer:
 
   @staticmethod
   def from_sharded(lb:LazyBuffer, devices:Tuple[str, ...], axis:Optional[int]=None):
-    lbs = [lb.contiguous() if lb.base != lb and not lb.is_unrealized_unpadded_const() else lb] * len(devices)
+    lbs = [lb.contiguous() if lb.base != lb and not lb.is_unrealized_unmasked_const() else lb] * len(devices)
     sharded_lbs = [lb.copy_to_device(d) for lb,d in zip(to_sharded(lbs, axis) if axis is not None else lbs, devices)]
-    return MultiLazyBuffer([lb if lb.is_unrealized_unpadded_const() else lb.contiguous() for lb in sharded_lbs], axis)
+    return MultiLazyBuffer([lb if lb.is_unrealized_unmasked_const() else lb.contiguous() for lb in sharded_lbs], axis)
 
   def copy_to_device(self, device:str) -> LazyBuffer:
     if self.axis is None: return self.lbs[self.real.index(True)].copy_to_device(device)
@@ -112,15 +112,15 @@ class MultiLazyBuffer:
   def _shape_to_single_shard(self, shape:Tuple[sint, ...], lb:LazyBuffer) -> Tuple[sint, ...]:
     return tuple(lb.shape[self.axis] if a == self.axis else s for a,s in enumerate(shape))
 
-  def r(self, op:ReduceOps, axis:Tuple[int, ...]) -> MultiLazyBuffer:
+  def r(self, op:ReduceOps, axis:Tuple[int, ...], acc_dt:Optional[DType]=None) -> MultiLazyBuffer:
     if self.axis is not None and self.axis in axis:
       # all-reduce on sharded axes
       new_shape = tuple(1 if i in axis else s for i,s in enumerate(self.shape))
-      reduced_parts = [x.r(op, axis) if r else x.const(0, shape=new_shape) for x,r in zip(self.lbs, self.real)]
+      reduced_parts = [x.r(op, axis, acc_dt) if r else x.const(0, shape=new_shape) for x,r in zip(self.lbs, self.real)]
       if all(self.real): return MultiLazyBuffer(all_reduce(op, reduced_parts), None)
       return MultiLazyBuffer(reduced_parts, None, self.real)
     # reduce on non sharded axes, piecewise is fine. if axis is None this is also correct
-    return MultiLazyBuffer([x.r(op, axis) for x in self.lbs], self.axis, self.real)
+    return MultiLazyBuffer([x.r(op, axis, acc_dt) for x in self.lbs], self.axis, self.real)
 
   # *** movement ops ***
 

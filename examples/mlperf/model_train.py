@@ -2,9 +2,10 @@ import functools
 import os
 import time
 from tqdm import tqdm
+import multiprocessing
 
 from tinygrad import Device, GlobalCounters, Tensor, TinyJit, dtypes
-from tinygrad.helpers import getenv, BEAM, WINO
+from tinygrad.helpers import getenv, BEAM, WINO, Context
 from tinygrad.nn.state import get_parameters, get_state_dict, safe_load, safe_save
 from tinygrad.nn.optim import LARS, SGD, OptimizerGroup
 
@@ -26,6 +27,9 @@ def train_resnet():
   GPUS = config["GPUS"] = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
   print(f"Training on {GPUS}")
   for x in GPUS: Device[x]
+
+  TRAIN_BEAM = getenv("TRAIN_BEAM", BEAM.value)
+  EVAL_BEAM = getenv("EVAL_BEAM", BEAM.value)
 
   # ** model definition and initializers **
   num_classes = 1000
@@ -60,9 +64,11 @@ def train_resnet():
   steps_in_val_epoch    = config["steps_in_val_epoch"]    = (len(get_val_files()) // EVAL_BS)
 
   config["DEFAULT_FLOAT"] = dtypes.default_float.name
-  config["BEAM"]    = BEAM.value
-  config["WINO"]    = WINO.value
-  config["SYNCBN"]  = getenv("SYNCBN")
+  config["BEAM"]          = BEAM.value
+  config["TRAIN_BEAM"]    = TRAIN_BEAM
+  config["EVAL_BEAM"]     = EVAL_BEAM
+  config["WINO"]          = WINO.value
+  config["SYNCBN"]        = getenv("SYNCBN")
 
   # ** Optimizer **
   skip_list = [v for k, v in get_state_dict(model).items() if "bn" in k or "bias" in k or "downsample.1" in k]
@@ -104,23 +110,27 @@ def train_resnet():
   def normalize(x): return (x.permute([0, 3, 1, 2]) - input_mean).cast(dtypes.default_float)
   @TinyJit
   def train_step(X, Y):
-    optimizer_group.zero_grad()
-    X = normalize(X)
-    out = model.forward(X)
-    loss = out.cast(dtypes.float32).sparse_categorical_crossentropy(Y, label_smoothing=0.1)
-    top_1 = (out.argmax(-1) == Y).sum()
-    (loss * loss_scaler).backward()
-    for t in optimizer_group.params: t.grad = t.grad.contiguous() / loss_scaler
-    optimizer_group.step()
-    scheduler_group.step()
-    return loss.realize(), top_1.realize()
+    with Context(BEAM=TRAIN_BEAM):
+      optimizer_group.zero_grad()
+      X = normalize(X)
+      out = model.forward(X)
+      loss = out.cast(dtypes.float32).sparse_categorical_crossentropy(Y, label_smoothing=0.1)
+      top_1 = (out.argmax(-1) == Y).sum()
+      (loss * loss_scaler).backward()
+      for t in optimizer_group.params: t.grad = t.grad.contiguous() / loss_scaler
+      optimizer_group.step()
+      scheduler_group.step()
+      return loss.realize(), top_1.realize()
+
   @TinyJit
   def eval_step(X, Y):
-    X = normalize(X)
-    out = model.forward(X)
-    loss = out.cast(dtypes.float32).sparse_categorical_crossentropy(Y, label_smoothing=0.1)
-    top_1 = (out.argmax(-1) == Y).sum()
-    return loss.realize(), top_1.realize()
+    with Context(BEAM=EVAL_BEAM):
+      X = normalize(X)
+      out = model.forward(X)
+      loss = out.cast(dtypes.float32).sparse_categorical_crossentropy(Y, label_smoothing=0.1)
+      top_1 = (out.argmax(-1) == Y).sum()
+      return loss.realize(), top_1.realize()
+
   def data_get(it):
     x, y, cookie = next(it)
     return x.shard(GPUS, axis=0).realize(), Tensor(y, requires_grad=False).shard(GPUS, axis=0), cookie
@@ -130,8 +140,8 @@ def train_resnet():
   for e in range(start_epoch, epochs):
     # ** train loop **
     Tensor.training = True
-    it = iter(tqdm(batch_load_resnet(batch_size=BS, val=False, shuffle=True, seed=seed*epochs + e),
-                   total=steps_in_train_epoch, desc=f"epoch {e}", disable=BENCHMARK))
+    batch_loader = batch_load_resnet(batch_size=BS, val=False, shuffle=True, seed=seed*epochs + e)
+    it = iter(tqdm(batch_loader, total=steps_in_train_epoch, desc=f"epoch {e}", disable=BENCHMARK))
     i, proc = 0, data_get(it)
     st = time.perf_counter()
     while proc is not None:
@@ -169,14 +179,14 @@ def train_resnet():
 
       if i == BENCHMARK:
         median_step_time = sorted(step_times)[(BENCHMARK + 1) // 2]  # in seconds
-        estimated_total_hours = median_step_time * steps_in_train_epoch * epochs / 60 / 60
-        print(f"Estimated training time: {estimated_total_hours:.0f}h{(estimated_total_hours - int(estimated_total_hours)) * 60:.0f}m")
+        estimated_total_minutes = int(median_step_time * steps_in_train_epoch * epochs / 60)
+        print(f"Estimated training time: {estimated_total_minutes // 60}h{estimated_total_minutes % 60}m")
         # if we are doing beam search, run the first eval too
-        if BEAM.value and e == start_epoch: break
+        if (TRAIN_BEAM or EVAL_BEAM) and e == start_epoch: break
         return
 
     # ** eval loop **
-    if (e + 1 - eval_start_epoch) % eval_epochs == 0:
+    if (e + 1 - eval_start_epoch) % eval_epochs == 0 and steps_in_val_epoch > 0:
       train_step.reset()  # free the train step memory :(
       eval_loss = []
       eval_times = []
@@ -251,6 +261,7 @@ def train_maskrcnn():
   pass
 
 if __name__ == "__main__":
+  multiprocessing.set_start_method('spawn')
   with Tensor.train():
     for m in getenv("MODEL", "resnet,retinanet,unet3d,rnnt,bert,maskrcnn").split(","):
       nm = f"train_{m}"
