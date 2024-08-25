@@ -1,5 +1,5 @@
 # Expanded Documentation
-[Expanded documentation](documentation/index.md)
+[Expanded documentation](/documentation/index.md)
 Welcome to the docs for tinygrad. This page is for users of the tinygrad library. We also have [developer docs](developer.md)
 
 tinygrad is not 1.0 yet, but it will be soon. The API has been pretty stable for a while.
